@@ -11,6 +11,9 @@ Also fixes a few bugs and leaks. This version allows the AudioClient to be resta
 Uses [cameron314's readerwriterqueue](https://github.com/cameron314/readerwriterqueue) to transport samples from the main audio thread to the user callback via a helper thread.
 This allows the end-user callback to be non-time-critical.
 
+The usage of the queue can be disabled at run-time or compile-time, which results in the callback to be called from the audio thread directly.
+In this mode it is the user's responsibility to handle the audio data without blocking for longer than the device's buffer duration. Usually, it is around 10ms.
+
 # Usage
 
 To start capturing an application, create an instance of the ProcessLoopbackCapture class and a callback that it can use.
@@ -18,7 +21,6 @@ To start capturing an application, create an instance of the ProcessLoopbackCapt
 The ProcessLoopbackCapture class can be instantiated globally, locally or allocated and deleted dynamically.
 
 ``` 
-#include <readerwriterqueue.h>
 #include <ProcessLoopbackCapture.h>
 
 ProcessLoopbackCapture LoopbackCapture;
@@ -34,7 +36,7 @@ void MyCallback(std::vector<unsigned char>::iterator &i1, std::vector<unsigned c
 }
 ```
 
-Somewhere in your code you can then set up the format, process id and callback and start the capture:
+Somewhere in your code you can then set up the format, process id and callback and start the capture.
 
 The format, callback and process id can be changed only while the capture is stopped.
 Unlike the original Windows Sample, the AudioClient will start correctly even if you start it on the same process again.
@@ -72,4 +74,6 @@ A ProcessLoopbackCapture instance can also be destroyed at any time. The AudioCl
 
 StartCapture is a blocking operation. On some systems, depending on load and device activity, there may be times where it takes a few seconds to finish.
 
-For all functions and their parameters see ProcessLoopbackCapture.h.
+For fast capture starting/stopping without changing any settings, you can use PauseCapture and ResumeCapture.
+
+For all functions, their parameters and notes see comments in the header file.
