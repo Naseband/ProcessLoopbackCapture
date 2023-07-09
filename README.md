@@ -14,6 +14,8 @@ This allows the end-user callback to be non-time-critical.
 The usage of the queue can be disabled at run-time or compile-time, which results in the callback to be called from the audio thread directly.
 In this mode it is the user's responsibility to handle the audio data without blocking for longer than the device's buffer duration. Usually, it is around 10ms.
 
+To disable the use of the queue completely (and remove the dependency on readerwriterqueue) define PROCESS_LOOPBACK_CAPTURE_NO_QUEUE before including ProcessLoopbackCapture.h, or as a preprocessor definition.
+
 # Usage
 
 To start capturing an application, create an instance of the ProcessLoopbackCapture class and a callback that it can use.
