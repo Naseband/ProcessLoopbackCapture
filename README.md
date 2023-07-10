@@ -1,6 +1,6 @@
 # Windows Process Loopback Capture
 
-A relatively simple class that uses Windows' AudioClient in loopback capture mode to capture audio coming from one process only.
+A relatively simple class that uses Windows' AudioClient in loopback capture mode to capture audio coming from one process and its children only.
 
 Calls a user-provided callback with the resulting audio data in little endian unsigned char PCM format.
 Supports 8, 16, 24 and 32 bit and any common Sample Rate up to 384,000Hz.
@@ -9,18 +9,20 @@ Based on the [original ApplicationLoopbackCapture example](https://github.com/mi
 Also fixes a few bugs and leaks. This version allows the AudioClient to be restarted at any point, including the same process.
 
 Uses [cameron314's readerwriterqueue](https://github.com/cameron314/readerwriterqueue) to transport samples from the main audio thread to the user callback via a helper thread.
-This allows the end-user callback to be non-time-critical.
+This allows the user callback to be non-time-critical at the cost of a delay between the actual audio output and the callback. This is usually the best option if you plan on storing audio data without worrying about audio glitches due to allocation or io operations.
 
-The usage of the queue can be disabled at run-time or compile-time, which results in the callback to be called from the audio thread directly.
-In this mode it is the user's responsibility to handle the audio data without blocking for longer than the device's buffer duration. Usually, it is around 10ms.
+For applications where latency is a concern, the usage of the queue and intermediate buffer/thread can be disabled at run-time or compile-time which results in the callback to be called from the main audio thread directly.
+In this mode it is your responsibility to handle the audio data without blocking for longer than the AudioClient's buffer duration. In loopback mode, the buffer duration seems to be unaffected by buffer size and always uses 10ms, but this may vary depending on the Windows Version used.
 
-To disable the use of the queue completely (and remove the dependency on readerwriterqueue) define PROCESS_LOOPBACK_CAPTURE_NO_QUEUE before including ProcessLoopbackCapture.h, or as a preprocessor definition.
+To disable the use of the queue and intermediate buffer at run-time, use SetIntermediateBufferEnabled(false) before starting the capture.
+
+To disable the use of the queue at compile-time (and remove the dependency on readerwriterqueue) define PROCESS_LOOPBACK_CAPTURE_NO_QUEUE as a preprocessor definition. This will also disable the SetIntermediateBufferEnabled function, because an intermediate buffer is not available.
 
 # Usage
 
 To start capturing an application, create an instance of the ProcessLoopbackCapture class and a callback that it can use.
 
-The ProcessLoopbackCapture class can be instantiated globally, locally or allocated and deleted dynamically.
+The ProcessLoopbackCapture class can be instantiated globally, locally or dynamically.
 
 ``` 
 #include <ProcessLoopbackCapture.h>
@@ -41,7 +43,6 @@ void MyCallback(std::vector<unsigned char>::iterator &i1, std::vector<unsigned c
 Somewhere in your code you can then set up the format, process id and callback and start the capture.
 
 The format, callback and process id can be changed only while the capture is stopped.
-Unlike the original Windows Sample, the AudioClient will start correctly even if you start it on the same process again.
 
 ```
 DWORD dwProcessId = GetMeSomeProcessId(); // Your Process ID
@@ -70,7 +71,7 @@ From there you can use StopCapture, PauseCapture, ResumeCapture and GetState to 
 
 If StartCapture returns an error, the capture client is reset completely and you are free to try again.
 
-A ProcessLoopbackCapture instance can also be destroyed at any time. The AudioClients will be unitialized properly.
+A ProcessLoopbackCapture instance can also be destroyed at any time. The AudioClient will be uninitialized properly.
 
 # Notes
 
