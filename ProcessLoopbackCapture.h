@@ -48,6 +48,8 @@ The buffer is resized to a minimum after a capture is stopped.
 #include <atomic>
 #include <thread>
 #include <vector>
+#include <string>
+#include <mutex>
 
 #if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
 #include <readerwriterqueue.h>
@@ -76,10 +78,11 @@ enum class eCaptureError : int
     DEVICE,
     ACTIVATION,
     INITIALIZE,
-    CAPTURE_SERVICE,
+    SERVICE,
     START,
     STOP,
-    EVENT
+    EVENT,
+    INTERFACE
 };
 
 namespace LoopbackCaptureConst
@@ -98,10 +101,11 @@ namespace LoopbackCaptureConst
         case eCaptureError::DEVICE: return "Failed to get device";
         case eCaptureError::ACTIVATION: return "Failed to activate device";
         case eCaptureError::INITIALIZE: return "Failed to init device";
-        case eCaptureError::CAPTURE_SERVICE: return "Failed to get capture service";
+        case eCaptureError::SERVICE: return "Failed to get interface pointer via service";
         case eCaptureError::START: return "Failed to start capture";
         case eCaptureError::STOP: return "Failed to stop capture";
         case eCaptureError::EVENT: return "Failed to create and set event";
+        case eCaptureError::INTERFACE: return "Failed to call Windows interface function";
         }
 
         return "Unknown";
@@ -162,6 +166,9 @@ public:
     // Default: true
     eCaptureError SetIntermediateBufferEnabled(bool bEnable);
 
+    eCaptureError SetLastPacketEnabled(bool bEnable);
+    eCaptureError GetLastPacket(std::vector<unsigned char> &vecPacket, size_t *pPacketID = nullptr);
+
     eCaptureState GetState();
 
     // If StartCapture fails, everything is reset to initial state.
@@ -213,6 +220,7 @@ private:
     DWORD                           m_dwProcessId;
     bool                            m_bProcessInclusive;
     bool                            m_bUseIntermediateBuffer;
+    std::atomic<bool>               m_bStoreLastPacket;
 
     void                            (*m_pCallbackFunc)(std::vector<unsigned char>::iterator&, std::vector<unsigned char>::iterator&, void*);
     void                            *m_pCallbackFuncUserData;
@@ -234,6 +242,10 @@ private:
 #endif
 
     std::vector<unsigned char>      m_vecIntermediateBuffer; // Used to align the audio data. Serves as storage if you use longer intervals.
+
+    std::mutex                      m_xLastPacketLock;
+    std::vector<unsigned char>      m_vecLastPacket;
+    size_t                          m_iLastPacketIndex;
 };
 
 // ----------------------------------------------------------------------- EOF

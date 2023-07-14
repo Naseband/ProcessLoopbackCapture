@@ -5,6 +5,7 @@
 #include <mmdeviceapi.h>
 #include <mfapi.h>
 #include <audioclientactivationparams.h>
+#include <audiopolicy.h>
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mmdevapi.lib")
 
@@ -17,32 +18,44 @@ using namespace std;
 // Afterwards call AsyncCallback::GetResult, which blocks until completed.
 
 // If successful, you will need to release the returned IAudioClient.
+// Call Reset() before ActivateAudioInterfaceAsync if you want to use the callback more than once.
 
 class ActivateAudioInterfaceAsyncCallback : public IActivateAudioInterfaceCompletionHandler
 {
 public:
 
+    ActivateAudioInterfaceAsyncCallback()
+    {
+        Reset();
+    }
+
+    void Reset()
+    {
+        m_bActivateFinished = false;
+        m_hrActivateResult = E_UNEXPECTED;
+        m_pAudioClient = nullptr;
+    }
+
+    void WaitForResult(HRESULT& hr, IAudioClient** pAudioClient)
+    {
+        m_bActivateFinished.wait(false);
+
+        hr = m_hrActivateResult;
+        *pAudioClient = m_pAudioClient;
+    }
+
+private:
+
     atomic<bool> m_bActivateFinished;
     HRESULT m_hrActivateResult;
     IAudioClient* m_pAudioClient;
 
-    ActivateAudioInterfaceAsyncCallback() :
-        m_hrActivateResult(E_UNEXPECTED),
-        m_pAudioClient(nullptr)
-    {
-        Init();
-    }
-
     STDMETHOD(ActivateCompleted)(IActivateAudioInterfaceAsyncOperation *activateOperation)
     {
-        IUnknown* pUnk = nullptr;
-
         m_hrActivateResult = E_UNEXPECTED;
-        HRESULT hr = activateOperation->GetActivateResult(&m_hrActivateResult, &pUnk);
+        activateOperation->GetActivateResult(&m_hrActivateResult, reinterpret_cast<IUnknown**>(&m_pAudioClient));
 
-        if (m_hrActivateResult == S_OK)
-            m_pAudioClient = reinterpret_cast<IAudioClient*>(pUnk);
-        else
+        if (m_hrActivateResult != S_OK)
             m_pAudioClient = nullptr;
 
         m_bActivateFinished = true;
@@ -67,24 +80,6 @@ public:
     {
         return 0;
     }
-
-    // Blocking call until operation is finished.
-    // Make sure that the operation was started successfully before calling this!
-    void WaitForResult(HRESULT& hr, IAudioClient** pAudioClient)
-    {
-        m_bActivateFinished.wait(false);
-
-        hr = m_hrActivateResult;
-        *pAudioClient = m_pAudioClient;
-    }
-
-    // If you want to reuse the callback, call this first.
-    void Init()
-    {
-        m_bActivateFinished = false;
-        m_hrActivateResult = E_UNEXPECTED;
-        m_pAudioClient = nullptr;
-    }
 };
 
 // ----------------------------------------------------------------------- ProcessLoopbackCapture
@@ -103,6 +98,7 @@ ProcessLoopbackCapture::ProcessLoopbackCapture() :
     m_dwProcessId(0),
     m_bProcessInclusive(false),
     m_bUseIntermediateBuffer(true),
+    m_bStoreLastPacket(false),
 
     m_pCallbackFunc(nullptr),
     m_pCallbackFuncUserData(nullptr),
@@ -116,7 +112,9 @@ ProcessLoopbackCapture::ProcessLoopbackCapture() :
     m_fMaxExecutionTime(0.0),
 
     m_pQueueAudioThread(nullptr),
-    m_bRunQueueAudioThread(false)
+    m_bRunQueueAudioThread(false),
+
+    m_iLastPacketIndex(0)
 {
     
 }
@@ -231,6 +229,28 @@ eCaptureError ProcessLoopbackCapture::SetIntermediateBufferEnabled(bool bEnable)
     return eCaptureError::NONE;
 }
 
+eCaptureError ProcessLoopbackCapture::SetLastPacketEnabled(bool bEnable)
+{
+    m_bStoreLastPacket = !!bEnable;
+
+    return eCaptureError::NONE;
+}
+
+eCaptureError ProcessLoopbackCapture::GetLastPacket(std::vector<unsigned char> &vecPacket, size_t *pPacketID)
+{
+    if (!m_bStoreLastPacket)
+        return eCaptureError::NOT_AVAILABLE;
+
+    scoped_lock lock(m_xLastPacketLock);
+
+    vecPacket = m_vecLastPacket;
+
+    if (pPacketID != nullptr)
+        *pPacketID = m_iLastPacketIndex;
+
+    return eCaptureError::NONE;
+}
+
 eCaptureState ProcessLoopbackCapture::GetState()
 {
     return m_CaptureState.load();
@@ -310,7 +330,7 @@ eCaptureError ProcessLoopbackCapture::StartCapture()
     if (m_hrLastError != S_OK)
     {
         Reset();
-        return eCaptureError::CAPTURE_SERVICE;
+        return eCaptureError::SERVICE;
     }
 
     // Create and set event
@@ -519,13 +539,11 @@ void ProcessLoopbackCapture::StopThreads()
 
 void ProcessLoopbackCapture::ProcessMainToCallback()
 {
-    HANDLE hThread = GetCurrentThread();
-
-    if(hThread)
-        SetThreadPriority(hThread, THREAD_PRIORITY_TIME_CRITICAL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     BYTE* pData = nullptr;
     UINT32 FramesAvailable = 0;
+    UINT64 BytesAvailable;
     DWORD dwCaptureFlags;
     // UINT64 u64DevicePosition = 0; // Not currently used
     // UINT64 u64QPCPosition = 0;
@@ -540,11 +558,13 @@ void ProcessLoopbackCapture::ProcessMainToCallback()
             if (!m_bRunMainAudioThread)
                 return;
             
+            auto tick_start = chrono::steady_clock::now();
+
             while (m_pAudioCaptureClient->GetBuffer(&pData, &FramesAvailable, &dwCaptureFlags, nullptr, nullptr) == S_OK)
             {
-                auto tick_start = chrono::steady_clock::now();
+                BytesAvailable = (UINT64)FramesAvailable * (UINT64)m_CaptureFormat.nBlockAlign;
 
-                for (UINT64 i = 0, j = (UINT64)FramesAvailable * (UINT64)m_CaptureFormat.nBlockAlign; i < j; ++i)
+                for (UINT64 i = 0; i < BytesAvailable; ++i)
                 {
                     if (m_dwMainThreadBytesToSkip)
                     {
@@ -556,12 +576,21 @@ void ProcessLoopbackCapture::ProcessMainToCallback()
                     }
                 }
 
+                if (m_bStoreLastPacket)
+                {
+                    scoped_lock lock(m_xLastPacketLock);
+
+                    m_vecLastPacket.clear();
+
+                    for (UINT64 i = 0; i < BytesAvailable; ++i)
+                    {
+                        m_vecLastPacket.push_back(pData[i]);
+                    }
+
+                    ++m_iLastPacketIndex;
+                }
+
                 m_pAudioCaptureClient->ReleaseBuffer(FramesAvailable);
-
-                auto dur = chrono::duration_cast<chrono::nanoseconds>(chrono::steady_clock::now() - tick_start).count() / 1e6;
-
-                if (dur > m_fMaxExecutionTime)
-                    m_fMaxExecutionTime = dur;
             }
 
             if (m_vecIntermediateBuffer.size() > 0)
@@ -575,6 +604,11 @@ void ProcessLoopbackCapture::ProcessMainToCallback()
 
                 m_vecIntermediateBuffer.clear();
             }
+
+            auto dur = chrono::duration_cast<chrono::nanoseconds>(chrono::steady_clock::now() - tick_start).count() / 1e6;
+
+            if (dur > m_fMaxExecutionTime)
+                m_fMaxExecutionTime = dur;
         }
     }
 }
@@ -583,13 +617,11 @@ void ProcessLoopbackCapture::ProcessMainToCallback()
 
 void ProcessLoopbackCapture::ProcessMainToQueue()
 {
-    HANDLE hThread = GetCurrentThread();
-
-    if (hThread)
-        SetThreadPriority(hThread, THREAD_PRIORITY_TIME_CRITICAL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     BYTE* pData = nullptr;
     UINT32 FramesAvailable = 0;
+    UINT64 BytesAvailable;
     DWORD dwCaptureFlags;
     // UINT64 u64DevicePosition = 0; // Not currently used
     // UINT64 u64QPCPosition = 0;
@@ -604,32 +636,45 @@ void ProcessLoopbackCapture::ProcessMainToQueue()
             if (!m_bRunMainAudioThread)
                 return;
 
-            if (m_bUseIntermediateBuffer)
-            {
-                while (m_pAudioCaptureClient->GetBuffer(&pData, &FramesAvailable, &dwCaptureFlags, nullptr, nullptr) == S_OK)
-                {
-                    auto tick_start = chrono::steady_clock::now();
+            auto tick_start = chrono::steady_clock::now();
 
-                    for (UINT64 i = 0, j = (UINT64)FramesAvailable * (UINT64)m_CaptureFormat.nBlockAlign; i < j; ++i)
+            while (m_pAudioCaptureClient->GetBuffer(&pData, &FramesAvailable, &dwCaptureFlags, nullptr, nullptr) == S_OK)
+            {
+                BytesAvailable = (UINT64)FramesAvailable * (UINT64)m_CaptureFormat.nBlockAlign;
+
+                for (UINT64 i = 0; i < BytesAvailable; ++i)
+                {
+                    if (m_dwMainThreadBytesToSkip)
                     {
-                        if (m_dwMainThreadBytesToSkip)
-                        {
-                            --m_dwMainThreadBytesToSkip;
-                        }
-                        else
-                        {
-                            m_Queue.enqueue(pData[i]);
-                        }
+                        --m_dwMainThreadBytesToSkip;
+                    }
+                    else
+                    {
+                        m_Queue.enqueue(pData[i]);
+                    }
+                }
+
+                if (m_bStoreLastPacket)
+                {
+                    scoped_lock lock(m_xLastPacketLock);
+
+                    m_vecLastPacket.clear();
+
+                    for (UINT64 i = 0; i < BytesAvailable; ++i)
+                    {
+                        m_vecLastPacket.push_back(pData[i]);
                     }
 
-                    m_pAudioCaptureClient->ReleaseBuffer(FramesAvailable);
-
-                    auto dur = chrono::duration_cast<chrono::nanoseconds>(chrono::steady_clock::now() - tick_start).count() / 1e6;
-
-                    if (dur > m_fMaxExecutionTime)
-                        m_fMaxExecutionTime = dur;
+                    ++m_iLastPacketIndex;
                 }
+
+                m_pAudioCaptureClient->ReleaseBuffer(FramesAvailable);
             }
+
+            auto dur = chrono::duration_cast<chrono::nanoseconds>(chrono::steady_clock::now() - tick_start).count() / 1e6;
+
+            if (dur > m_fMaxExecutionTime)
+                m_fMaxExecutionTime = dur;
         }
     }
 }
