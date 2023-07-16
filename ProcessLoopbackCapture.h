@@ -27,6 +27,9 @@ The user callback is not subject to timer glitches if you take longer to execute
 However, longer execution times may cause the internal buffer to grow in size.
 The buffer is resized to a minimum after a capture is stopped.
 
+Link against mfplat.lib and mmdevapi.lib.
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mmdevapi.lib")
 */
 
 #if defined PROCESS_LOOPBACK_CAPTURE_NO_QUEUE
@@ -48,8 +51,6 @@ The buffer is resized to a minimum after a capture is stopped.
 #include <atomic>
 #include <thread>
 #include <vector>
-#include <string>
-#include <mutex>
 
 #if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
 #include <readerwriterqueue.h>
@@ -111,21 +112,12 @@ namespace LoopbackCaptureConst
         return "Unknown";
     }
 
-    constexpr unsigned int VALID_SAMPLE_RATES[] =
-    {
-        8000,
-        11025,
-        16000,
-        22050,
-        44100,
-        48000,
-        88200,
-        96000,
-        176400,
-        192000,
-        352800,
-        384000
-    };
+    // If these limits are exceeded, the audioclient will not trigger events
+
+    constexpr unsigned int MIN_SAMPLE_RATE = 100;
+    constexpr unsigned int MAX_SAMPLE_RATE = 384000; // Keep in mind some media players and devices support only up to 192k/200k Hz
+
+    constexpr unsigned int MAX_BIT_DEPTH = 32;
 
     constexpr unsigned int MIN_CHANNEL_COUNT = 1;
     constexpr unsigned int MAX_CHANNEL_COUNT = 8;
@@ -140,9 +132,10 @@ public:
     ProcessLoopbackCapture();
     ~ProcessLoopbackCapture();
 
-    // Supported formats are listed in the LoopbackCaptureConst namespace.
-    // iBitDepth must be 8, 16, 24 or 32.
-    eCaptureError SetCaptureFormat(unsigned int iSampleRate, unsigned int iBitDepth, unsigned int iChannelCount);
+    // Supported format values are listed in the LoopbackCaptureConst namespace.
+    // The format tag must be either WAVE_FORMAT_IEEE_FLOAT or WAVE_FORMAT_PCM.
+    // When using WAVE_FORMAT_IEEE_FLOAT, the stream will always have a bit depth equal to the size of float (32).
+    eCaptureError SetCaptureFormat(unsigned int iSampleRate, unsigned int iBitDepth, unsigned int iChannelCount, unsigned int iFormatTag = WAVE_FORMAT_PCM);
     bool CopyCaptureFormat(WAVEFORMATEX &Format);
 
     // dwProcessId is the ID of the target process, but its children will always be considered part of it and the exclusion chain.
@@ -158,16 +151,14 @@ public:
     eCaptureError SetCallbackInterval(DWORD dwInterval);
 
     // If you define PROCESS_LOOPBACK_CAPTURE_NO_QUEUE the intermediate buffer will never be used and this function returns an error (NOT_AVAILABLE).
-    // If true, the intermediate buffer will be passed to the user callback from a seperate thread.
+    // 
+    // If true, the intermediate buffer will be passed to the user callback from a seperate thread (default behaviour).
     // This will result in a non-time-critical callback, but it may delay buffer data by the given interval (see SetCallbackInterval).
+    // 
     // If false, the user callback will be called from the main audio thread.
     // In this mode, you are responsible for handling the audio data in a fast manner.
     // Usually, the internal buffer is cleared every 10ms and the callback should take no longer than this period to execute.
-    // Default: true
     eCaptureError SetIntermediateBufferEnabled(bool bEnable);
-
-    eCaptureError SetLastPacketEnabled(bool bEnable);
-    eCaptureError GetLastPacket(std::vector<unsigned char> &vecPacket, size_t *pPacketID = nullptr);
 
     eCaptureState GetState();
 
@@ -189,6 +180,8 @@ public:
     // Returns/Resets the max execution time of the main audio thread (milliseconds).
     double GetMaxExecutionTime();
     void ResetMaxExecutionTime();
+
+    eCaptureError GetIntermediateBuffer(std::vector<unsigned char> *&pVector);
 
 private:
 
@@ -220,7 +213,6 @@ private:
     DWORD                           m_dwProcessId;
     bool                            m_bProcessInclusive;
     bool                            m_bUseIntermediateBuffer;
-    std::atomic<bool>               m_bStoreLastPacket;
 
     void                            (*m_pCallbackFunc)(std::vector<unsigned char>::iterator&, std::vector<unsigned char>::iterator&, void*);
     void                            *m_pCallbackFuncUserData;
@@ -242,10 +234,6 @@ private:
 #endif
 
     std::vector<unsigned char>      m_vecIntermediateBuffer; // Used to align the audio data. Serves as storage if you use longer intervals.
-
-    std::mutex                      m_xLastPacketLock;
-    std::vector<unsigned char>      m_vecLastPacket;
-    size_t                          m_iLastPacketIndex;
 };
 
 // ----------------------------------------------------------------------- EOF
