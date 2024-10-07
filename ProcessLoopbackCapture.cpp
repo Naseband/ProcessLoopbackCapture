@@ -6,56 +6,49 @@
 #include <mfapi.h>
 #include <audioclientactivationparams.h>
 #include <audiopolicy.h>
+#include <avrt.h>
 
 using namespace std;
 
-// ----------------------------------------------------------------------- 
+// ------------------------------------------------------------ 
 
 // Simple class that turns ActivateAudioInterfaceAsync into a blocking operation.
 // Use an instance of this class for ActivateAudioInterfaceAsync.
 // Afterwards call AsyncCallback::Wait, which blocks until completed.
-// AgileObject inheritance not strictly needed but the API might change in the future.
-
-// If successful, you will need to release the returned IAudioClient.
-// The IActivateAudioInterfaceAsyncOperation interface pointer will also need to be released, regardless of success.
-// Call Reset() between ActivateAudioInterfaceAsync calls if you want to use the callback more than once.
+// The AudioInterface pointer can be obtained from the IActivateAudioInterfaceAsyncOperation pointer before releasing it.
 
 class ActivateAudioInterfaceAsyncCallback : 
-    public IActivateAudioInterfaceCompletionHandler,
-    public IAgileObject
+    public IActivateAudioInterfaceCompletionHandler
 {
 public:
 
-    ActivateAudioInterfaceAsyncCallback()
+    ActivateAudioInterfaceAsyncCallback() :
+        m_bActivateCompleted(false)
     {
-        Reset();
-    }
 
-    void Reset()
-    {
-        m_bActivateFinished = false;
-    }
+	}
 
     void Wait()
     {
-        m_bActivateFinished.wait(false);
+        m_bActivateCompleted.wait(false);
+		m_bActivateCompleted = false;
     }
 
 protected:
 
-    atomic<bool> m_bActivateFinished;
+    atomic<bool> m_bActivateCompleted;
 
     STDMETHOD(ActivateCompleted)(IActivateAudioInterfaceAsyncOperation *activateOperation)
     {
-        m_bActivateFinished = true;
-        m_bActivateFinished.notify_one();
+        m_bActivateCompleted = true;
+        m_bActivateCompleted.notify_all();
 
         return S_OK;
     }
 
-    STDMETHOD(QueryInterface)(REFIID riid, void **ppvObject)
+    STDMETHOD(QueryInterface)(const IID &riid, void **ppvObject)
     {
-        if (riid == __uuidof(IUnknown) || riid == __uuidof(IAgileObject))
+        if (riid == __uuidof(IAgileObject)) // Removed IUnknown
         {
             *ppvObject = this;
             return S_OK;
@@ -75,7 +68,7 @@ protected:
     }
 };
 
-// ----------------------------------------------------------------------- ProcessLoopbackCapture
+// ------------------------------------------------------------ ProcessLoopbackCapture
 
 // public
 
@@ -96,15 +89,18 @@ ProcessLoopbackCapture::ProcessLoopbackCapture() :
     m_pCallbackFuncUserData(nullptr),
     m_dwCallbackInterval(100),
 
-    m_bThreadsStarted(false),
+	m_bRunAudioThreads(false),
 
     m_pMainAudioThread(nullptr),
-    m_bRunMainAudioThread(false),
     m_dwMainThreadBytesToSkip(0),
     m_fMaxExecutionTime(0.0),
 
-    m_pQueueAudioThread(nullptr),
-    m_bRunQueueAudioThread(false)
+    m_pQueueAudioThread(nullptr)
+
+#if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
+	,
+	m_Queue(2048)
+#endif
 {
     
 }
@@ -125,17 +121,17 @@ eCaptureError ProcessLoopbackCapture::SetCaptureFormat(unsigned int iSampleRate,
     if (m_CaptureState != eCaptureState::READY)
         return eCaptureError::STATE;
 
-    if (iSampleRate < LoopbackCaptureConst::MIN_SAMPLE_RATE || iSampleRate > LoopbackCaptureConst::MAX_SAMPLE_RATE)
+    if (iSampleRate < 4000)
         return eCaptureError::PARAM;
 
-    if (iBitDepth == 0 || iBitDepth > LoopbackCaptureConst::MAX_BIT_DEPTH || (iBitDepth % CHAR_BIT) != 0)
+    if (iBitDepth == 0 || iBitDepth > 32 || (iBitDepth % 8) != 0)
         return eCaptureError::PARAM;
 
-    if (iChannelCount < LoopbackCaptureConst::MIN_CHANNEL_COUNT || iChannelCount > LoopbackCaptureConst::MAX_CHANNEL_COUNT)
+    if (iChannelCount < 1 || iChannelCount > 1024)
         return eCaptureError::PARAM;
 
     if (iFormatTag == WAVE_FORMAT_IEEE_FLOAT)
-        iBitDepth = sizeof(float) * CHAR_BIT;
+        iBitDepth = 32;
     else if (iFormatTag != WAVE_FORMAT_PCM)
         return eCaptureError::PARAM;
 
@@ -143,7 +139,7 @@ eCaptureError ProcessLoopbackCapture::SetCaptureFormat(unsigned int iSampleRate,
     m_CaptureFormat.nChannels = (WORD)iChannelCount;
     m_CaptureFormat.nSamplesPerSec = (DWORD)iSampleRate;
     m_CaptureFormat.wBitsPerSample = (WORD)iBitDepth;
-    m_CaptureFormat.nBlockAlign = m_CaptureFormat.nChannels * m_CaptureFormat.wBitsPerSample / CHAR_BIT;
+    m_CaptureFormat.nBlockAlign = m_CaptureFormat.wBitsPerSample / 8 * m_CaptureFormat.nChannels;
     m_CaptureFormat.nAvgBytesPerSec = m_CaptureFormat.nSamplesPerSec * m_CaptureFormat.nBlockAlign;
 
     m_bCaptureFormatInitialized = true;
@@ -175,7 +171,7 @@ eCaptureError ProcessLoopbackCapture::SetTargetProcess(DWORD dwProcessId, bool b
     return eCaptureError::NONE;
 }
 
-eCaptureError ProcessLoopbackCapture::SetCallback(void (*pCallbackFunc)(std::vector<unsigned char>::iterator&, std::vector<unsigned char>::iterator&, void*), void *pUserData)
+eCaptureError ProcessLoopbackCapture::SetCallback(void (*pCallbackFunc)(const std::vector<unsigned char>::iterator&, const std::vector<unsigned char>::iterator&, void*), void *pUserData)
 {
     if (m_CaptureState != eCaptureState::READY)
         return eCaptureError::STATE;
@@ -238,22 +234,22 @@ eCaptureError ProcessLoopbackCapture::StartCapture()
 
     // Set up Params
 
-    AUDIOCLIENT_ACTIVATION_PARAMS Blob{};
-    Blob.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-    Blob.ProcessLoopbackParams.ProcessLoopbackMode = m_bProcessInclusive ? PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE : PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
-    Blob.ProcessLoopbackParams.TargetProcessId = m_dwProcessId;
+    AUDIOCLIENT_ACTIVATION_PARAMS blob{};
+	blob.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+	blob.ProcessLoopbackParams.ProcessLoopbackMode = m_bProcessInclusive ? PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE : PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+	blob.ProcessLoopbackParams.TargetProcessId = m_dwProcessId;
 
-    PROPVARIANT ActivateParams = {};
-    ActivateParams.vt = VT_BLOB;
-    ActivateParams.blob.cbSize = sizeof(AUDIOCLIENT_ACTIVATION_PARAMS);
-    ActivateParams.blob.pBlobData = (BYTE*)&Blob;
+    PROPVARIANT activation_params{};
+	activation_params.vt = VT_BLOB;
+	activation_params.blob.cbSize = sizeof(AUDIOCLIENT_ACTIVATION_PARAMS);
+	activation_params.blob.pBlobData = (BYTE*)&blob;
 
     // Activate ("Async")
 
-    IActivateAudioInterfaceAsyncOperation* pActivateOp = nullptr;
-    ActivateAudioInterfaceAsyncCallback AsyncCallback;
+    IActivateAudioInterfaceAsyncOperation* activation_operation = nullptr;
+    ActivateAudioInterfaceAsyncCallback async_callback;
 
-    m_hrLastError = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, __uuidof(IAudioClient), &ActivateParams, &AsyncCallback, &pActivateOp);
+    m_hrLastError = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, __uuidof(IAudioClient), &activation_params, &async_callback, &activation_operation);
 
     if (m_hrLastError != S_OK)
     {
@@ -261,10 +257,10 @@ eCaptureError ProcessLoopbackCapture::StartCapture()
         return eCaptureError::DEVICE;
     }
 
-    AsyncCallback.Wait();
+	async_callback.Wait();
 
-    pActivateOp->GetActivateResult(&m_hrLastError, reinterpret_cast<IUnknown**>(&m_pAudioClient));
-    pActivateOp->Release();
+	m_hrLastError = activation_operation->GetActivateResult(&m_hrLastError, reinterpret_cast<IUnknown**>(&m_pAudioClient));
+	activation_operation->Release();
 
     if (m_hrLastError != S_OK)
     {
@@ -274,7 +270,8 @@ eCaptureError ProcessLoopbackCapture::StartCapture()
     
     // Initialize (AudioClient is valid)
 
-    m_hrLastError = m_pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+    m_hrLastError = m_pAudioClient->Initialize(
+		AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
         0, // 100ns units, 10 = 1 micro, 10000 = 1 milli. Does not seem to do anything for this mode (Win10).
         0, // Do not use for Capture Clients.
@@ -386,6 +383,15 @@ void ProcessLoopbackCapture::ResetMaxExecutionTime()
     m_fMaxExecutionTime = 0.0;
 }
 
+#if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
+
+size_t ProcessLoopbackCapture::GetQueueSize()
+{
+	return m_Queue.size_approx();
+}
+
+#endif
+
 eCaptureError ProcessLoopbackCapture::GetIntermediateBuffer(std::vector<unsigned char> *&pVector)
 {
     if (m_CaptureState == eCaptureState::READY)
@@ -400,12 +406,12 @@ eCaptureError ProcessLoopbackCapture::GetIntermediateBuffer(std::vector<unsigned
 
 void ProcessLoopbackCapture::Reset()
 {
-    if (m_CaptureState == eCaptureState::CAPTURING) // Prevent another event trigger 
+    StopThreads();
+
+    if (m_CaptureState == eCaptureState::CAPTURING)
     {
         m_pAudioClient->Stop();
     }
-
-    StopThreads();
 
     if (m_pAudioCaptureClient != nullptr)
     {
@@ -431,7 +437,7 @@ void ProcessLoopbackCapture::Reset()
 
 void ProcessLoopbackCapture::StartThreads(double fInitialDurationToSkip)
 {
-    if (m_bThreadsStarted)
+    if (m_bRunAudioThreads)
         return;
 
     if (fInitialDurationToSkip < 0.0)
@@ -439,53 +445,39 @@ void ProcessLoopbackCapture::StartThreads(double fInitialDurationToSkip)
 
     m_dwMainThreadBytesToSkip = (DWORD)(m_CaptureFormat.nSamplesPerSec * fInitialDurationToSkip) * (DWORD)m_CaptureFormat.nBlockAlign;
 
+	m_bRunAudioThreads = true;
+
 #if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
 
     if (m_bUseIntermediateBuffer)
     {
-        m_bRunMainAudioThread = true;
         m_pMainAudioThread = new thread(&ProcessLoopbackCapture::ProcessMainToQueue, this);
-
-        m_bRunQueueAudioThread = true;
         m_pQueueAudioThread = new thread(&ProcessLoopbackCapture::ProcessIntermediate, this);
     }
     else
     {
-        m_bRunMainAudioThread = true;
         m_pMainAudioThread = new thread(&ProcessLoopbackCapture::ProcessMainToCallback, this);
-
-        m_bRunQueueAudioThread = false;
         m_pQueueAudioThread = nullptr;
     }
 
 #else
 
-    m_bRunMainAudioThread = true;
     m_pMainAudioThread = new thread(&ProcessLoopbackCapture::ProcessMainToCallback, this);
-
-    m_bRunQueueAudioThread = false;
     m_pQueueAudioThread = nullptr;
 
 #endif
-
-    m_bThreadsStarted = true;
 }
 
 void ProcessLoopbackCapture::StopThreads()
 {
-    if (!m_bThreadsStarted)
+    if (!m_bRunAudioThreads)
         return;
 
-    m_bRunMainAudioThread = false;
-    m_bRunQueueAudioThread = false;
-
-    SetEvent(m_hSampleReadyEvent);
+	m_bRunAudioThreads = false;
 
 #if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
 
     m_pMainAudioThread->join();
-    delete m_pMainAudioThread;
-    m_pMainAudioThread = nullptr;
 
     if (m_bUseIntermediateBuffer)
     {
@@ -493,6 +485,9 @@ void ProcessLoopbackCapture::StopThreads()
         delete m_pQueueAudioThread;
         m_pQueueAudioThread = nullptr;
     }
+
+    delete m_pMainAudioThread;
+    m_pMainAudioThread = nullptr;
 
     while (m_Queue.pop()); // Flush
 
@@ -506,30 +501,27 @@ void ProcessLoopbackCapture::StopThreads()
 
     m_vecIntermediateBuffer.clear();
     m_vecIntermediateBuffer.shrink_to_fit();
-
-    m_bThreadsStarted = false;
 }
 
 void ProcessLoopbackCapture::ProcessMainToCallback()
 {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    DWORD dwTaskIndex = 0;
+    HANDLE hTaskHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &dwTaskIndex);
 
     BYTE* pData = nullptr;
     UINT32 iFramesAvailable;
     UINT64 iBytesAvailable;
     DWORD dwCaptureFlags;
-    // UINT64 u64DevicePosition = 0; // Not currently used
-    // UINT64 u64QPCPosition = 0;
 
-    while (m_bRunMainAudioThread)
+    while (m_bRunAudioThreads)
     {
         // The event is signaled if either a sample is ready or the capture was stopped.
 
-        if (WaitForSingleObject(m_hSampleReadyEvent, 5000) == WAIT_OBJECT_0)
+        if (WaitForSingleObject(m_hSampleReadyEvent, 50) == WAIT_OBJECT_0)
         {
             // The capture was stopped, exit thread.
-            if (!m_bRunMainAudioThread)
-                return;
+            if (!m_bRunAudioThreads)
+                break;
 
             auto tick_start = chrono::steady_clock::now();
 
@@ -545,7 +537,7 @@ void ProcessLoopbackCapture::ProcessMainToCallback()
                     }
                     else
                     {
-                        m_vecIntermediateBuffer.push_back(pData[i]);
+                        m_vecIntermediateBuffer.emplace_back(pData[i]);
                     }
                 }
 
@@ -570,30 +562,32 @@ void ProcessLoopbackCapture::ProcessMainToCallback()
                 m_fMaxExecutionTime = dur;
         }
     }
+
+    if (hTaskHandle)
+        AvRevertMmThreadCharacteristics(hTaskHandle);
 }
 
 #if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
 
 void ProcessLoopbackCapture::ProcessMainToQueue()
 {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    DWORD dwTaskIndex = 0;
+    HANDLE hTaskHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &dwTaskIndex);
 
     BYTE* pData = nullptr;
     UINT32 iFramesAvailable;
     UINT64 iBytesAvailable;
-    DWORD dwCaptureFlags;
-    // UINT64 u64DevicePosition = 0; // Not currently used
-    // UINT64 u64QPCPosition = 0;
+	DWORD dwCaptureFlags;
 
-    while (m_bRunMainAudioThread)
+    while (m_bRunAudioThreads)
     {
         // The event is signaled if either a sample is ready or the capture was stopped.
 
-        if (WaitForSingleObject(m_hSampleReadyEvent, 5000) == WAIT_OBJECT_0)
+        if (WaitForSingleObject(m_hSampleReadyEvent, 50) == WAIT_OBJECT_0)
         {
             // The capture was stopped, exit thread.
-            if (!m_bRunMainAudioThread)
-                return;
+            if (!m_bRunAudioThreads)
+                break;
 
             auto tick_start = chrono::steady_clock::now();
 
@@ -622,23 +616,26 @@ void ProcessLoopbackCapture::ProcessMainToQueue()
                 m_fMaxExecutionTime = dur;
         }
     }
+
+    if (hTaskHandle)
+        AvRevertMmThreadCharacteristics(hTaskHandle);
 }
 
 void ProcessLoopbackCapture::ProcessIntermediate()
 {
-    while (m_bRunQueueAudioThread)
+    while (m_bRunAudioThreads)
     {
-        // Get all data from queue into intermediate buffer and pass it to the callback
-        // At the same time, we make sure the data stays aligned for the callback
+        // Get all data from the queue into intermediate buffer and pass it to the callback
 
         unsigned char Data;
 
         while (m_Queue.try_dequeue(Data))
         {
-            m_vecIntermediateBuffer.push_back(Data);
+            m_vecIntermediateBuffer.emplace_back(Data);
         }
 
-        // Get aligned buffer size and send to callback, then delete
+        // Get buffer size and send to callback, then delete
+		// Make sure the temp. buffer is aligned, the queue can contain stray bytes
 
         size_t iAlignedSize = m_vecIntermediateBuffer.size() / m_CaptureFormat.nBlockAlign * m_CaptureFormat.nBlockAlign;
 
@@ -654,10 +651,10 @@ void ProcessLoopbackCapture::ProcessIntermediate()
             m_vecIntermediateBuffer.erase(m_vecIntermediateBuffer.begin(), m_vecIntermediateBuffer.begin() + iAlignedSize);
         }
 
-        Sleep(m_dwCallbackInterval);
+		std::this_thread::sleep_for(std::chrono::milliseconds(m_dwCallbackInterval));
     }
 }
 
 #endif // #if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
 
-// ----------------------------------------------------------------------- EOF
+// ------------------------------------------------------------ EOF

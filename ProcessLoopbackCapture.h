@@ -6,14 +6,6 @@ Relatively simple class that uses Windows' AudioClient in loopback capture mode 
 
 Calls a user-provided callback with the resulting audio data in byte-by-byte PCM format.
 
-Uses cameron314's readerwriterqueue
-https://github.com/cameron314/readerwriterqueue
-
-Define PROCESS_LOOPBACK_CAPTURE_NO_QUEUE before including ProcessLoopbackCapture (or as a global) to not use the Queue.
-This will force ProcessLoopbackCapture to run without intermediate buffer mode.
-
-Does not use WIL/WRL, which provides better compatibility than the original sample.
-
 Supports restarting one or more clients on the same process. The original ApplicationLoopback Sample leaked an interface pointer
 that prevented another operation from being started.
 https://github.com/microsoft/windows-classic-samples/tree/main/Samples/ApplicationLoopback
@@ -27,9 +19,10 @@ The user callback is not subject to timer glitches if you take longer to execute
 However, longer execution times may cause the internal buffer to grow in size.
 The buffer is resized to a minimum after a capture is stopped.
 
-Link against mfplat.lib and mmdevapi.lib.
+Link against mfplat.lib, mmdevapi.lib and avrt.lib.
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mmdevapi.lib")
+#pragma comment(lib, "avrt.lib")
 */
 
 #if defined PROCESS_LOOPBACK_CAPTURE_NO_QUEUE
@@ -38,13 +31,7 @@ Link against mfplat.lib and mmdevapi.lib.
 #define PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE        true
 #endif
 
-#define WIN32_LEAN_AND_MEAN
-#define VC_EXTRALEAN
-#define NOMINMAX
 #include <windows.h>
-#undef WIN32_LEAN_AND_MEAN
-#undef VC_EXTRALEAN
-#undef NOMINMAX
 
 #include <AudioClient.h>
 
@@ -56,7 +43,7 @@ Link against mfplat.lib and mmdevapi.lib.
 #include <readerwriterqueue.h>
 #endif
 
-// ----------------------------------------------------------------------- 
+// ------------------------------------------------------------ 
 
 enum class eCaptureState : int
 {
@@ -111,19 +98,9 @@ namespace LoopbackCaptureConst
 
         return "Unknown";
     }
-
-    // If these limits are exceeded, the audioclient will not trigger events
-
-    constexpr unsigned int MIN_SAMPLE_RATE = 100;
-    constexpr unsigned int MAX_SAMPLE_RATE = 384000; // Keep in mind some media players and devices support only up to 192k/200k Hz
-
-    constexpr unsigned int MAX_BIT_DEPTH = 32;
-
-    constexpr unsigned int MIN_CHANNEL_COUNT = 1;
-    constexpr unsigned int MAX_CHANNEL_COUNT = 8;
 }
 
-// ----------------------------------------------------------------------- 
+// ------------------------------------------------------------ 
 
 class ProcessLoopbackCapture
 {
@@ -143,7 +120,7 @@ public:
     // If it is false, the audio of this process will be excluded from all other sounds on the same device.
     eCaptureError SetTargetProcess(DWORD dwProcessId, bool bInclusive = true);
 
-    eCaptureError SetCallback(void (*pCallbackFunc)(std::vector<unsigned char>::iterator&, std::vector<unsigned char>::iterator&, void*), void *pUserData = nullptr);
+    eCaptureError SetCallback(void (*pCallbackFunc)(const std::vector<unsigned char>::iterator&, const std::vector<unsigned char>::iterator&, void*), void *pUserData = nullptr);
 
     // The interval is subject to Windows scheduling. Usually, the wait time is at least 16 and often a multiple of 16.
     // Only used if the intermediate buffer is active.
@@ -181,6 +158,10 @@ public:
     double GetMaxExecutionTime();
     void ResetMaxExecutionTime();
 
+#if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
+	size_t GetQueueSize();
+#endif
+
     eCaptureError GetIntermediateBuffer(std::vector<unsigned char> *&pVector);
 
 private:
@@ -214,26 +195,24 @@ private:
     bool                            m_bProcessInclusive;
     bool                            m_bUseIntermediateBuffer;
 
-    void                            (*m_pCallbackFunc)(std::vector<unsigned char>::iterator&, std::vector<unsigned char>::iterator&, void*);
+    void                            (*m_pCallbackFunc)(const std::vector<unsigned char>::iterator&, const std::vector<unsigned char>::iterator&, void*);
     void                            *m_pCallbackFuncUserData;
     DWORD                           m_dwCallbackInterval;
 
-    bool                            m_bThreadsStarted;
+	std::atomic<bool>               m_bRunAudioThreads;
 
     std::thread                     *m_pMainAudioThread;
-    std::atomic<bool>               m_bRunMainAudioThread;
     DWORD                           m_dwMainThreadBytesToSkip;
     std::atomic<double>             m_fMaxExecutionTime;
 
     std::thread                     *m_pQueueAudioThread;
-    std::atomic<bool>               m_bRunQueueAudioThread;
 
 #if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
-    moodycamel::ReaderWriterQueue<unsigned char>
-                                    m_Queue;
+    moodycamel::ReaderWriterQueue<unsigned char, 2048>
+									m_Queue;
 #endif
 
     std::vector<unsigned char>      m_vecIntermediateBuffer; // Used to align the audio data. Serves as storage if you use longer intervals.
 };
 
-// ----------------------------------------------------------------------- EOF
+// ------------------------------------------------------------ EOF
