@@ -15,21 +15,13 @@ Settings (ie Capture Format, Process ID, etc) can only be modified if the captur
 When the callback function provided is called, you are expected to retrieve all audio data from it.
 After each call, the internal buffer is cleared.
 
-The user callback is not subject to timer glitches if you take longer to execute.
-However, longer execution times may cause the internal buffer to grow in size.
-The buffer is resized to a minimum after a capture is stopped.
+Optionally uses cameron314's readerwriterqueue to provide a more lenient user callback (https://github.com/cameron314/readerwriterqueue).
+To use it, define PROCESS_LOOPBACK_CAPTURE_USE_QUEUE as a precompiler macro and enable it via the SetIntermediateThreadEnabled member.
 
 Link against mfplat.lib, mmdevapi.lib and avrt.lib.
-#pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mmdevapi.lib")
 #pragma comment(lib, "avrt.lib")
 */
-
-#if defined PROCESS_LOOPBACK_CAPTURE_NO_QUEUE
-#define PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE        false
-#else
-#define PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE        true
-#endif
 
 #include <windows.h>
 
@@ -39,7 +31,7 @@ Link against mfplat.lib, mmdevapi.lib and avrt.lib.
 #include <thread>
 #include <vector>
 
-#if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
+#if defined PROCESS_LOOPBACK_CAPTURE_USE_QUEUE
 #include <readerwriterqueue.h>
 #endif
 
@@ -122,21 +114,23 @@ public:
 
     eCaptureError SetCallback(void (*pCallbackFunc)(const std::vector<unsigned char>::iterator&, const std::vector<unsigned char>::iterator&, void*), void *pUserData = nullptr);
 
-    // The interval is subject to Windows scheduling. Usually, the wait time is at least 16 and often a multiple of 16.
-    // Only used if the intermediate buffer is active.
+    // The interval (in milliseconds) is subject to Windows scheduling. Usually, the wait time is at least 16 and often a multiple of 16.
+    // Only used if the intermediate thread is active.
     // Default: 100
     eCaptureError SetCallbackInterval(DWORD dwInterval);
 
-    // If you define PROCESS_LOOPBACK_CAPTURE_NO_QUEUE the intermediate buffer will never be used and this function returns an error (NOT_AVAILABLE).
+    // If PROCESS_LOOPBACK_CAPTURE_USE_QUEUE is not defined (default), the intermediate thread will not be available and this function fails.
     // 
-    // If true, the intermediate buffer will be passed to the user callback from a seperate thread (default behaviour).
+    // If bEnable is set to true, the audio data will be passed to the user callback from a seperate thread.
     // This will result in a non-time-critical callback, but it may delay buffer data by the given interval (see SetCallbackInterval).
     // 
-    // If false, the user callback will be called from the main audio thread.
-    // In this mode, you are responsible for handling the audio data in a fast manner.
+    // If false, the user callback will be called directly from the main audio thread.
+    // In this mode, you are responsible for handling the audio data quickly.
     // Usually, the internal buffer is cleared every 10ms and the callback should take no longer than this period to execute.
-    eCaptureError SetIntermediateBufferEnabled(bool bEnable);
+    eCaptureError SetIntermediateThreadEnabled(bool bEnable);
 
+    // Returns the current state of the capture (ready, paused or started).
+    // Safe to call from any thread.
     eCaptureState GetState();
 
     // If StartCapture fails, everything is reset to initial state.
@@ -147,59 +141,56 @@ public:
     eCaptureError StopCapture();
 
     // Pauses capture. Note that there may still be some samples in the queue to process at the time of calling this.
+    // Those samples will always be discarded.
     eCaptureError PauseCapture();
-    // When resuming, you want to skip 0.1 seconds of the buffer. WASAPI keeps some of the old buffer when restarting capture.
+    // When resuming, you typically want to skip 0.1 seconds of the buffer. WASAPI keeps some of the old buffer when restarting capture.
     eCaptureError ResumeCapture(double fInitialDurationToSkip = 0.1);
 
     // Gets the last error code returned by Windows interface functions. Does not apply to eCaptureError::PARAM and eCaptureError::STATE.
     HRESULT GetLastErrorResult();
 
-    // Returns/Resets the max execution time of the main audio thread (milliseconds).
+    // Returns/Resets the max execution time of the main audio thread (in milliseconds).
     double GetMaxExecutionTime();
     void ResetMaxExecutionTime();
 
-#if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
-	size_t GetQueueSize();
-#endif
-
-    eCaptureError GetIntermediateBuffer(std::vector<unsigned char> *&pVector);
+    // Gets the current approx. size of the intermediate queue if the intermediate thread is available and in use.
+    // Fails if PROCESS_LOOPBACK_CAPTURE_USE_QUEUE is not defined or SetIntermediateThreadEnabled was not set to true.
+    eCaptureError GetQueueSize(size_t& iSize);
 
 private:
 
     void Reset();
 
-    // Duration in seconds of the initial buffer duration to skip. Used in Resume because some digital devices have leftover frames after resuming capture (Stop, then Start).
+    // Duration in seconds of the initial buffer duration to skip. Used in Resume because some digital devices have leftover frames after resuming capture (IAudioClient::Stop, IAudioClient::Start).
     void StartThreads(double fInitialDurationToSkip);
     void StopThreads();
 
     void ProcessMainToCallback();
 
-#if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
+#if defined PROCESS_LOOPBACK_CAPTURE_USE_QUEUE
     void ProcessMainToQueue();
     void ProcessIntermediate();
 #endif
-
-    bool                            m_bInitMF;
 
     HRESULT                         m_hrLastError;
 
     std::atomic<eCaptureState>      m_CaptureState;
 
     IAudioClient                    *m_pAudioClient;
-    IAudioCaptureClient             *m_pAudioCaptureClient; // Accessed from capture thread
+    IAudioCaptureClient             *m_pAudioCaptureClient; // Accessed from main audio thread
     HANDLE                          m_hSampleReadyEvent;
 
     bool                            m_bCaptureFormatInitialized;
     WAVEFORMATEX                    m_CaptureFormat{};
     DWORD                           m_dwProcessId;
     bool                            m_bProcessInclusive;
-    bool                            m_bUseIntermediateBuffer;
+    bool                            m_bUseIntermediateThread;
 
     void                            (*m_pCallbackFunc)(const std::vector<unsigned char>::iterator&, const std::vector<unsigned char>::iterator&, void*);
     void                            *m_pCallbackFuncUserData;
     DWORD                           m_dwCallbackInterval;
 
-	std::atomic<bool>               m_bRunAudioThreads;
+    std::atomic<bool>               m_bRunAudioThreads;
 
     std::thread                     *m_pMainAudioThread;
     DWORD                           m_dwMainThreadBytesToSkip;
@@ -207,12 +198,12 @@ private:
 
     std::thread                     *m_pQueueAudioThread;
 
-#if PROCESS_LOOPBACK_CAPTURE_QUEUE_AVAILABLE
-    moodycamel::ReaderWriterQueue<unsigned char, 2048>
-									m_Queue;
+#if defined PROCESS_LOOPBACK_CAPTURE_USE_QUEUE
+    moodycamel::ReaderWriterQueue<unsigned char, 8192>
+                                    m_Queue;
 #endif
 
-    std::vector<unsigned char>      m_vecIntermediateBuffer; // Used to align the audio data. Serves as storage if you use longer intervals.
+    std::vector<unsigned char>      m_AudioData; // Used to align the audio data in intermediate mode.
 };
 
 // ------------------------------------------------------------ EOF

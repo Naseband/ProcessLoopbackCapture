@@ -1,9 +1,9 @@
 # Windows Process Loopback Capture
 
-A relatively simple class that uses Windows' AudioClient in loopback capture mode to capture audio coming from one process and its children only.
+A relatively simple class that uses Windows' AudioClient in loopback capture mode to capture audio coming from one process and its children only (Windows 10/11).
 
 Calls a user-provided callback with the resulting audio data in little endian unsigned char PCM format.
-Supports 8-32 bit PCM Int/Float and any Sample Rate between 1 kHz and 384 kHz.
+Supports 8-32 bit PCM Int/Float and any Sample Rate above 1 kHz supported by WASAPI's SRC.
 
 Based on the [original ApplicationLoopbackCapture example](https://github.com/microsoft/windows-classic-samples/tree/main/Samples/ApplicationLoopback) but does not require WIL/WRL to be installed or included.
 Also fixes a few bugs and leaks. This version allows the AudioClient to be restarted at any point, including the same process.
@@ -11,28 +11,33 @@ Also fixes a few bugs and leaks. This version allows the AudioClient to be resta
 (Optionally) uses [cameron314's readerwriterqueue](https://github.com/cameron314/readerwriterqueue) to transport samples from the main audio thread to the user callback via a helper thread.
 This allows the user callback to be non-time-critical at the cost of a delay between the actual audio output and the callback. This is usually the best option if you plan on storing audio data without worrying about audio glitches due to allocation or io operations.
 
-For applications where latency is a concern, the usage of the queue and intermediate buffer/thread can be disabled at run-time or compile-time which results in the callback to be called from the main audio thread directly.
-In this mode it is your responsibility to handle the audio data without blocking for longer than the AudioClient's buffer duration. In loopback mode, the buffer duration seems to be unaffected by buffer size and always uses 10ms, but this may vary depending on the actual device.
+By default, the queue is not used and there is no dependency on readerwriterqueue.
 
-To disable the use of the queue and intermediate buffer at run-time, use SetIntermediateBufferEnabled(false) before starting the capture.
+If you wish to enable it, define PROCESS_LOOPBACK_CAPTURE_USE_QUEUE as a preprocessor macro and use SetIntermediateThreadEnabled(true).
 
-To disable the use of the queue at compile-time (and remove the dependency on readerwriterqueue) define PROCESS_LOOPBACK_CAPTURE_NO_QUEUE as a preprocessor macro. This will also disable the SetIntermediateBufferEnabled function, because an intermediate buffer is not available.
+In order to successfully start an AudioClient you need to initialize COM (call CoInitialize(Ex), found in combaseapi.h).
+Note that MFStartup also initializes COM if you do already use it, however the actual MF functionality is not required.
+
+You will also need to link against mmdevapi.lib (for ActivateAudioInterfaceAsync) and avrt.lib (for setting thread characteristics).
 
 # Usage
 
-To start capturing an application, create an instance of the ProcessLoopbackCapture class and a callback that it can use.
+To start capturing an application, create an instance of the ProcessLoopbackCapture class and define a callback that it can use.
 
 ``` 
+#include <combaseapi.h> // For CoInitialie(Ex)
 #include <ProcessLoopbackCapture.h>
 
 ProcessLoopbackCapture LoopbackCapture;
 
 std::vector<unsigned char> g_MySampleData;
 
-void MyCallback(std::vector<unsigned char>::iterator &i1, std::vector<unsigned char>::iterator &i2, void *pUserData)
+void MyCallback(const std::vector<unsigned char>::iterator &i1, const std::vector<unsigned char>::iterator &i2, void *pUserData)
 {
-    // This callback is not time critical. There will be no audio glitches if you take longer than the callback interval.
-    // In a real application you would potentially lock a mutex here to exchange data with other threads.
+    // By default, this callback is time critical. There will be audio glitches if you take longer than the device interval.
+    // If the use of the queue is enabled, you can take as long as you wish at the cost of a growing queue size.
+
+    // Some synchronization ...
 
     g_MySampleData.insert(g_MySampleData.end(), i1, i2);
 }
@@ -40,9 +45,9 @@ void MyCallback(std::vector<unsigned char>::iterator &i1, std::vector<unsigned c
 
 Somewhere in your code you can then set up the format, process id and callback and start the capture.
 
-The format, callback and process id can be changed only while the capture is stopped.
-
 ```
+CoInitializeEx(NULL, COINIT_MULTITHREADED); // Initialize COM
+
 DWORD dwProcessId = GetMeSomeProcessId(); // Your Process ID
 
 LoopbackCapture.SetCaptureFormat(44100, 16, 2, WAVE_FORMAT_IEEE_FLOAT); // Supports WAVE_FORMAT_PCM and WAVE_FORMAT_IEEE_FLOAT
@@ -63,19 +68,24 @@ if(eError != eCaptureError::NONE)
 }
 
 // We are now capturing!
+// ...
+
+LoopbackCature.StopCapture();
+
+CoUninitialize();
 ``` 
 
-From there you can use StopCapture, PauseCapture, ResumeCapture and GetState to control the capture. GetState is thread safe, but all other functions must be called on the same thread that StartCapture was called on.
+You can use StopCapture, PauseCapture, ResumeCapture and GetState to control the capture. GetState is thread safe, but all other functions must be called on the same thread that StartCapture was called on.
 
 If StartCapture returns an error, the capture client is reset completely and you are free to try again.
 
-A ProcessLoopbackCapture instance can also be destroyed at any time. The AudioClient will be uninitialized properly.
+A ProcessLoopbackCapture instance can also be destroyed at any time. The AudioClient will be stopped properly.
 Again, make sure that if destroying the object would cause the capture to be stopped, you will need to destroy it on the same thread that *started* the capture.
 This is a requirement from the WASAPI engine. Not doing so can lead to random errors and crashes.
 
 # Notes
 
-StartCapture is a blocking operation. On some systems, depending on load and device activity, there may be times where it takes a few seconds to execute.
+StartCapture is a blocking operation. On some systems, depending on load and device activity, there may be times where it takes a few hundred milliseconds to execute.
 
 For fast capture starting/stopping without changing any settings, you can use PauseCapture and ResumeCapture.
 
