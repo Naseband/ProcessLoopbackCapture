@@ -3,9 +3,7 @@
 #include <chrono>
 
 #include <mmdeviceapi.h>
-#include <mfapi.h>
 #include <audioclientactivationparams.h>
-#include <audiopolicy.h>
 #include <avrt.h>
 
 using namespace std;

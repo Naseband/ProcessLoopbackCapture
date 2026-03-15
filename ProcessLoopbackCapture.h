@@ -18,7 +18,7 @@ After each call, the internal buffer is cleared.
 Optionally uses cameron314's readerwriterqueue to provide a more lenient user callback (https://github.com/cameron314/readerwriterqueue).
 To use it, define PROCESS_LOOPBACK_CAPTURE_USE_QUEUE as a precompiler macro and enable it via the SetIntermediateThreadEnabled member.
 
-Link against mfplat.lib, mmdevapi.lib and avrt.lib.
+Link against mmdevapi.lib and avrt.lib.
 #pragma comment(lib, "mmdevapi.lib")
 #pragma comment(lib, "avrt.lib")
 */
